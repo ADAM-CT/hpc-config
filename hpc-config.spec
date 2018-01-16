@@ -1,5 +1,5 @@
 Name:		hpc-config
-Version:	1.1.5
+Version:	1.1.6
 Release:	1%{?dist}
 License:	GPLv2+
 Summary:	Suite of utilities to deploy HPC clusters generic configuration
@@ -45,6 +45,10 @@ the boot sequence.
 %{_initddir}/hpc-config-apply
 
 %changelog
+
+* Tue Jan 16 2018 Thomas Hamel <thomas-externe.hamel@edf.fr> - 1.1.6
+  - New release 1.1.6
+  - Optimize hpc-config-push
 
 * Thu Aug 17 2017 Thomas Hamel <thomas-externe.hamel@edf.fr> - 1.1.4
   - New release 1.1.4
