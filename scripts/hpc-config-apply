@@ -35,7 +35,10 @@ import configparser
 import logging
 import io
 import shutil
+import yaml
 import platform
+
+from sys import stdout
 
 distribution = platform.dist()[0]
 distribution_version = platform.dist()[1]
@@ -49,6 +52,7 @@ else:
 
 DEFAULT_TMPDIR = '/tmp'
 DEFAULT_ENVIRONMENT = 'production'
+DEFAULT_AREA = 'default'
 
 PUPPET_ENV_ARCHIVE_NAME = 'puppet-config-environment.tar.xz'
 PUPPET_ENV_BASE_PATH = '/etc/puppet/environments'
@@ -65,11 +69,13 @@ KEYS_BASE_MODE = 0o700
 HIERA_CONF_ARCHIVE_NAME = 'hiera.yaml'
 HIERA_CONF_PATH = '/etc/puppet/hiera.yaml'
 
-FACTS_CONF_ARCHIVE_NAME = 'hpc-config-facts.yaml'
-FACTS_CONF_PATH = '/var/lib/puppet/facts.d/hpc-config-facts.yaml'
+NODES_YAML_ARCHIVE_NAME = 'cluster-nodes.yaml'
+NODES_YAML_PATH = '/etc/hpc-config/cluster-nodes.yaml'
 
 PUPPET_CONF_ARCHIVE_NAME = 'puppet.conf'
 PUPPET_CONF_PATH = '/etc/puppet/puppet.conf'
+
+FACTS_CONF_PATH = '/var/lib/puppet/facts.d/hpc-config-facts.yaml'
 
 KERNEL_CMDLINE_PREFIX = 'hpc_conf.'
 
@@ -141,6 +147,11 @@ def get_parameters():
         'environment', DEFAULT_ENVIRONMENT, {},
         default_section, args, cmdline_args)
     params['environment'] = env
+
+    # Get the area
+    params['area'] = get_parameter(
+        'area', DEFAULT_AREA, {},
+        default_section, args, cmdline_args)
 
     # Find the environment section
     if env not in config:
@@ -241,6 +252,10 @@ def parse_args():
                         dest='environment',
                         nargs='?', help='Environment name')
 
+    parser.add_argument('--area', '-a',
+                        dest='area',
+                        nargs='?', help='Aera name')
+
     parser.add_argument('--tmpdir', '-t',
                         dest='tmpdir',
                         nargs='?', help='Change TMPDIR env for puppet run.')
@@ -305,7 +320,7 @@ def http_get_file(url, root_source_port=False):
             logging.debug("Trying to connect with source port %s", source_port)
             http.connect()
             connect_ok = True
-        except OSError as err:
+        except urllib3.exceptions.NewConnectionError as err:
             logging.warn(
                 "Failed to connect to http(s) server %s with " % url +
                 "source port: %s, error: %s. Retrying..." % (source_port, err)
@@ -401,24 +416,22 @@ def get_hiera_conf(source, environment, version='latest'):
     return
 
 
-def get_facts_conf(source, environment, version='latest'):
+def get_nodes_yaml(source, environment, version='latest'):
     if source is None:
-        logging.info("Source is undefined. Skipping retrieval of Facts.")
+        logging.info("Source is undefined. Skipping retrieval of %s.",
+                     NODES_YAML_ARCHIVE_NAME)
         return
-    facts_conf_url = '/'.join([
+    nodes_yaml_url = '/'.join([
         source.rstrip('/'),
         environment,
         version,
-        FACTS_CONF_ARCHIVE_NAME
+        NODES_YAML_ARCHIVE_NAME
     ])
-    parent_dir = os.path.dirname(FACTS_CONF_PATH)
-    if not os.path.isdir(parent_dir):
-        logging.debug("Creating parent directory %s", parent_dir)
-        os.makedirs(parent_dir, 0o755)
-    logging.info("Getting Facts config from %s", facts_conf_url)
-    if os.path.exists(FACTS_CONF_PATH):
-        os.remove(FACTS_CONF_PATH)
-    get_url(facts_conf_url, FACTS_CONF_PATH)
+    parent_dir = os.path.dirname(NODES_YAML_PATH)
+    logging.info("Getting cluster nodes config from %s", nodes_yaml_url)
+    if os.path.exists(NODES_YAML_PATH):
+        os.remove(NODES_YAML_PATH)
+    get_url(nodes_yaml_url, NODES_YAML_PATH)
     return
 
 
@@ -442,7 +455,7 @@ def get_puppet_conf(source, environment, version='latest'):
     return
 
 
-def get_puppet_environment(source, environment, version='latest'):
+def get_puppet_environment(source, environment, area, version='latest'):
     ensure_directory(PUPPET_ENV_BASE_PATH,
                      PUPPET_ENV_BASE_OWNER,
                      PUPPET_ENV_BASE_GROUP,
@@ -455,6 +468,7 @@ def get_puppet_environment(source, environment, version='latest'):
         source.rstrip('/'),
         environment,
         version,
+        area,
         PUPPET_ENV_ARCHIVE_NAME
     ])
     puppet_env_path = os.path.join(PUPPET_ENV_BASE_PATH, environment)
@@ -465,6 +479,25 @@ def get_puppet_environment(source, environment, version='latest'):
         shutil.rmtree(puppet_env_path)
     extract_url(env_url, PUPPET_ENV_BASE_PATH)
     return
+
+
+def gen_private_files_fact(source, environment, area):
+    """Generate a custom static external fact for private_files_dir based on
+       source, environment and area."""
+    logging.info("Generating private files directory external static fact %s",
+                 FACTS_CONF_PATH)
+    content = {
+        'private_files_dir':
+            "%s/%s/latest/files/%s" % (source, environment, area)
+    }
+
+    parent_dir = os.path.dirname(FACTS_CONF_PATH)
+    if not os.path.isdir(parent_dir):
+        logging.debug("Creating parent directory %s", parent_dir)
+        os.makedirs(parent_dir, 0o755)
+
+    with open(FACTS_CONF_PATH, 'w+') as fact_f:
+        fact_f.write(yaml.dump(content))
 
 
 def puppet_apply(environment,
@@ -545,11 +578,10 @@ if __name__ == "__main__":
     locale.setlocale(locale.LC_ALL, LOCALE)
 
     params = get_parameters()
-    verbosity = params['verbosity']
-    setup_logging(verbosity)
-    logging.debug("Parameters: %s.", params)
 
+    verbosity = params['verbosity']
     environment = params['environment']
+    area = params['area']
     keys_source = params['keys_source']
     source = params['source']
     deploy_step = params['deploy_step']
@@ -559,15 +591,23 @@ if __name__ == "__main__":
     keep = params['keep']
     profile = params['profile']
 
+    if stdout.isatty() and verbosity == 0:
+        verbosity = 1
+
+    setup_logging(verbosity)
+    logging.debug("Parameters: %s.", params)
+
     get_keys(keys_source)
 
-    get_puppet_environment(source, environment)
+    get_puppet_environment(source, environment, area)
 
     get_hiera_conf(source, environment)
 
-    get_facts_conf(source, environment)
+    get_nodes_yaml(source, environment)
 
     get_puppet_conf(source, environment)
+
+    gen_private_files_fact(source, environment, area)
 
     code = puppet_apply(environment=environment,
                         deploy_step=deploy_step,

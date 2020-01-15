@@ -9,7 +9,7 @@ hpc-config-apply - download and apply a puppet-hpc configuration
        hpc-config-apply [-h] [--dry-run] [--keep] [--no-kernel-args]
                         [--profile] [--config [CONFIG_FILE]]
                         [--source [SOURCE]] [--environment [ENVIRONMENT]]
-                        [--tmpdir [TMPDIR]]
+                        [--area [AREA]] [--tmpdir [TMPDIR]]
                         [--deploy-step [{production,usbdisk}]]
                         [--keys-source [KEYS_SOURCE]] [--tags [TAGS]]
                         [--verbose]
@@ -33,6 +33,8 @@ files via HTTP and applies this configuration on a cluster node.
                           Configuration source URL
     --environment [ENVIRONMENT], -e [ENVIRONMENT]
                           Environment name
+    --area [AREA], -a [AREA]
+                          Area name
     --tmpdir [TMPDIR], -t [TMPDIR]
                           Change TMPDIR env for puppet run.
     --deploy-step [{production,usbdisk}], -d [{production,usbdisk}]
@@ -40,8 +42,8 @@ files via HTTP and applies this configuration on a cluster node.
     --keys-source [KEYS_SOURCE], -k [KEYS_SOURCE]
                           Secret keys source
     --tags [TAGS]         Puppet tags (comma separated list)
-    --verbose, -v         More output, can be specified multiple times.
-
+    --verbose, -v         More output, can be specified multiple times (default:
+                          -v if stdout is TTY, nothing otherwise)
 
 # PARAMETERS
 
@@ -91,6 +93,7 @@ Here is an example of a typical file with only a '[DEFAULT]' section:
 
     [DEFAULT]
     environment=production
+    area=default
     source=http://masternode/hpc-config
     keys_source=http://masternode/secret
 
@@ -101,6 +104,16 @@ option can be used to preserve those data on the node after the run.
 
 The permissions of directories containing sensitive data (keys and Puppet
 environment are modified to make them only readable by root.
+
+# OUTPUT
+
+If the stdout of hpc-config-apply is a TTY, the first verbose mode is enabled
+by default. Additional output can be obtained by setting multiple verbose
+flags.
+
+If the stdout is not a TTY, hpc-config-apply will only print warnings and
+errors on stderr and the output of Puppet will be directed to syslog by
+default. This can be changed by setting at least one verbose flag in parameter.
 
 # EXAMPLES
 

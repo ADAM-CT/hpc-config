@@ -25,14 +25,17 @@
 # <http://www.gnu.org/licenses/>.
 
 import os
+import fnmatch
 import argparse
 import configparser
 from io import StringIO
 import tarfile
 import sys
+import subprocess
 import logging
 logger = logging.getLogger(__name__)
 import tempfile
+import glob
 import shutil
 import boto
 import boto.s3
@@ -43,8 +46,12 @@ import socket
 import warnings
 import time
 import hashlib
+import yaml
 from multiprocessing.dummy import Pool as ThreadPool
 from multiprocessing import Pool
+from datetime import datetime
+
+_area_passwords_cache = {}
 
 def conf_copy(src, dst, *, follow_symlinks=True):
     """Alternate copy function for shutil.copytree() in order to properly
@@ -52,9 +59,16 @@ def conf_copy(src, dst, *, follow_symlinks=True):
        files into the tmp directory. If the path is a directory, call copytree()
        with self as copy_function, otherwise (flat file) call copy2()."""
     if os.path.isdir(src):
-        shutil.copytree(src, dst,
-                        symlinks=not follow_symlinks,
-                        copy_function=conf_copy)
+        # if dst already exist, skip level by calling conf_copy() on src/*
+        if os.path.exists(dst):
+            for item in os.listdir(src):
+                subsrc = os.path.join(src, item)
+                subdst = os.path.join(dst, item)
+                conf_copy(subsrc, subdst, follow_symlinks=follow_symlinks)
+        else:
+            shutil.copytree(src, dst,
+                            symlinks=not follow_symlinks,
+                            copy_function=conf_copy)
     else:
         shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
 
@@ -93,6 +107,7 @@ class AppConf():
         # action
 
         self.full_tmp_cleanup = False
+        self.list_environments = False
 
         # paths
 
@@ -101,14 +116,16 @@ class AppConf():
         # This one is hard-coded, there is no configuration parameter to
         # change it since it would be irrelevant to change it.
         self.conf_environment = 'environment.conf'
-        self.facts_private = None
+        self.nodes_private = None
         self.dir_modules_generic = None
         self.dir_modules_private = None
         self.dir_manifests_generic = None
         self.dir_manifests_private = None
         self.dir_hieradata_generic = None
         self.dir_hieradata_private = None
+        self.src_dir_hieradata_private = None
         self.dir_files_private = None
+        self.src_dir_files_private = None
 
 
         self.dir_tmp = None
@@ -124,17 +141,18 @@ class AppConf():
         logger.debug("- mode: %s", str(self.mode))
         logger.debug("- destination_root: %s", str(self.destination_root))
         logger.debug("- destination: %s", str(self.destination))
+        logger.debug("- areas: %s", str(self.areas))
         logger.debug("- dir_tmp: %s", str(self.dir_tmp))
         logger.debug("- conf_puppet: %s", str(self.conf_puppet))
         logger.debug("- conf_hiera: %s", str(self.conf_hiera))
-        logger.debug("- facts_private: %s", str(self.facts_private))
+        logger.debug("- nodes_private: %s", str(self.nodes_private))
         logger.debug("- dir_modules_generic: %s", str(self.dir_modules_generic))
         logger.debug("- dir_modules_private: %s", str(self.dir_modules_private))
         logger.debug("- dir_manifests_generic: %s", str(self.dir_manifests_generic))
         logger.debug("- dir_manifests_private: %s", str(self.dir_manifests_private))
         logger.debug("- dir_hieradata_generic: %s", str(self.dir_hieradata_generic))
-        logger.debug("- dir_hieradata_private: %s", str(self.dir_hieradata_private))
-        logger.debug("- dir_files_private: %s", str(self.dir_files_private))
+        logger.debug("- src_dir_hieradata_private: %s", str(self.src_dir_hieradata_private))
+        logger.debug("- src_dir_files_private: %s", str(self.src_dir_files_private))
         logger.debug("- posix_file_mode: %s", str(self.posix_file_mode))
         logger.debug("- posix_dir_mode: %s", str(self.posix_dir_mode))
         logger.debug("- s3_access_key: %s", str(self.s3_access_key))
@@ -146,9 +164,8 @@ class AppConf():
         logger.debug("- sftp_username: %s", str(self.sftp_username))
         logger.debug("- sftp_private_key: %s", str(self.sftp_private_key))
 
-    @property
-    def archive(self):
-        return os.path.join(self.dir_tmp_gen, 'puppet-config-environment.tar.xz')
+    def archive_path(self, area):
+        return os.path.join(self.dir_tmp_gen, area, 'puppet-config-environment.tar.xz')
 
     @property
     def conf_environment_gen(self):
@@ -172,6 +189,7 @@ def parse_conf():
       "version = latest\n"
       "mode = posix\n"
       "destination = /var/www/html/hpc-config\n"
+      "areas = default\n"
       "[posix]\n"
       "file_mode = 644\n"
       "dir_mode = 755\n"
@@ -191,7 +209,7 @@ def parse_conf():
       "privatedata = hpc-privatedata\n"
       "puppet_conf = ${privatedata}/puppet-config/${global:cluster}/puppet.conf\n"
       "hiera_conf = ${privatedata}/puppet-config/${global:cluster}/hiera.yaml\n"
-      "facts_private = ${privatedata}/puppet-config/${global:cluster}/hpc-config-facts.yaml\n"
+      "nodes_private = ${privatedata}/puppet-config/${global:cluster}/cluster-nodes.yaml\n"
       "modules_generic = ${puppethpc}/puppet-config/cluster,${puppethpc}/puppet-config/modules,/usr/share/puppet/modules\n"
       "modules_private = ${privatedata}/puppet-config/${global:cluster}/modules\n"
       "manifests_generic = ${puppethpc}/puppet-config/manifests\n"
@@ -208,17 +226,21 @@ def parse_conf():
     conf.version = parser.get('global', 'version')
     conf.mode = parser.get('global', 'mode')
     conf.destination_root = parser.get('global', 'destination')
+    conf.areas = parser.get('global', 'areas').split(',')
+    conf.main_area = conf.areas[0] # the main area is the first declared area
     conf.dir_tmp = parser.get('paths', 'tmp')
     conf.conf_puppet = parser.get('paths', 'puppet_conf')
     conf.conf_hiera = parser.get('paths', 'hiera_conf')
-    conf.facts_private = parser.get('paths', 'facts_private')
+    if parser.has_option('paths', 'facts_private'):
+        logger.warning('configuration facts_private is deprecated, use nodes_private')
+    conf.nodes_private = parser.get('paths', 'nodes_private')
     conf.dir_modules_generic = parser.get('paths', 'modules_generic').split(',')
     conf.dir_modules_private = parser.get('paths', 'modules_private')
     conf.dir_manifests_generic = parser.get('paths', 'manifests_generic')
     conf.dir_manifests_private = parser.get('paths', 'manifests_private')
     conf.dir_hieradata_generic = parser.get('paths', 'hieradata_generic')
-    conf.dir_hieradata_private = parser.get('paths', 'hieradata_private')
-    conf.dir_files_private = parser.get('paths', 'files_private')
+    conf.src_dir_hieradata_private = parser.get('paths', 'hieradata_private')
+    conf.src_dir_files_private = parser.get('paths', 'files_private')
     conf.s3_access_key = parser.get('s3', 'access_key')
     conf.s3_secret_key = parser.get('s3', 'secret_key')
     conf.s3_bucket_name = parser.get('s3', 'bucket_name')
@@ -249,6 +271,9 @@ def parse_args():
                         nargs='?')
     parser.add_argument('--full-tmp-cleanup',
                         help='Full tmp dir cleanup.',
+                        action='store_true')
+    parser.add_argument('-l', '--list',
+                        help='List pushed environments.',
                         action='store_true')
     parser.add_argument('--enable-python-warnings',
                         help="Don't hide some Python warnings.",
@@ -286,17 +311,136 @@ def override_conf(args):
         conf.version = args.version
     if args.full_tmp_cleanup:
         conf.full_tmp_cleanup = True
+    if args.list:
+        conf.list_environments = True
 
-def mktmpd():
-    """Make tmp generate dir and its parents."""
+
+def init_tmpd():
+    """Create tmp directory used to build areas archives, areas private files
+       hierarchy and perform on-the-fly re-encryptions.
+
+       This procedures also copies the private hiera repository to this
+       temporary directory in order to avoid later on-the-fly re-encryption of
+       area eyaml files into the sysadmin local copy, which would lead to local
+       modifications of their Git repositories.
+
+       The procedures also set some conf.dir_* parameters appropriately.
+    """
     if not os.path.isdir(conf.dir_tmp):
         os.makedirs(conf.dir_tmp)
     conf.dir_tmp_gen = tempfile.mkdtemp(dir=conf.dir_tmp)
+    conf.dir_tmp_keys = os.path.join(conf.dir_tmp_gen, 'keys')
 
-def build_tarball():
+    conf.dir_hieradata_private = os.path.join(conf.dir_tmp_gen,
+                                              'private_build',
+                                              conf.src_dir_hieradata_private)
+    conf.dir_files_private = os.path.join(conf.dir_tmp_gen,
+                                          'private_build',
+                                          'files')
+    shutil.copytree(conf.src_dir_hieradata_private,
+                    conf.dir_hieradata_private,
+                    copy_function=conf_copy)
 
-    logger.info("creating archive %s", conf.archive)
-    tar = tarfile.open(name=conf.archive, mode='w:xz', dereference=True)
+
+def get_area_decrypt_password(area):
+    """This function decrypt and parse the cluster_decrypt_password of a given
+       area.
+
+       This function can only work _before_ eyaml files are re-encrypted with
+       reencrypt_area_eyaml_file()."""
+    if area in _area_passwords_cache.keys():
+        return _area_passwords_cache[area]
+
+    # get cluster_decrypt_password from area yaml file using eyaml and system
+    # keys:
+    #   eyaml decrypt --file $hieradata/$cluster/areas/$area.yaml
+    area_yaml_path = os.path.join(conf.dir_hieradata_private, conf.cluster,
+                                  'areas', area + '.yaml')
+    cmd = ['eyaml', 'decrypt', '--file', area_yaml_path]
+    eyaml_run = subprocess.check_output(cmd)
+    area_yaml = yaml.load(eyaml_run)
+    _area_passwords_cache[area] = area_yaml['cluster_decrypt_password']
+    return _area_passwords_cache[area]
+
+
+def encrypt_file(infile, outfile, key):
+    """Run openssl to encrypt infile with AES key."""
+    cmd = ['openssl', 'aes-256-cbc', '-md', 'sha256',
+           '-in', infile,
+           '-out', outfile,
+           '-k', key ]
+    subprocess.check_call(cmd)
+
+
+def decrypt_file(infile, outfile, key):
+    """Run openssl to decrypt infile with AES key."""
+    cmd = ['openssl', 'aes-256-cbc', '-md', 'sha256', '-d',
+           '-in', infile,
+           '-out', outfile,
+           '-k', key ]
+    subprocess.check_call(cmd)
+
+
+def decrypt_extract_eyaml_keys():
+    """This procedures decrypt and extract all areas (except main area) eyaml
+       encryption keys. These keys will be required later by
+       reencrypt_area_eyaml_file() to reencrypt the area eyaml file."""
+    main_area_encoding_key = get_area_decrypt_password(conf.main_area)
+    for area in conf.areas:
+        if area != conf.main_area:
+            # decrypt other area eyaml keys archive from source files into tmpdir
+            other_area_keys_dir = os.path.join(conf.src_dir_files_private, conf.main_area, 'eyaml', area)
+            other_area_keys_path_in = os.path.join(other_area_keys_dir, 'keys.tar.xz.enc')
+            other_area_keys_path_out = os.path.join(conf.dir_tmp_keys, area, 'keys.tar.xz')
+            logger.debug("decrypt/extract eyaml keys %s of area %s", other_area_keys_path_in, area)
+            os.makedirs(os.path.join(conf.dir_tmp_keys, area))
+            decrypt_file(other_area_keys_path_in, other_area_keys_path_out,main_area_encoding_key)
+            # decrypt: openssl aes-256-cbc -md sha256 -in $IN -out $OUT -key $KEY
+            # encrypt: openssl aes-256-cbc -md sha256 -d -in $IN -out $OUT -key $KEY
+            other_area_keys_arch = tarfile.open(other_area_keys_path_out, mode='r')
+            other_area_keys_arch.extractall(path=os.path.join(conf.dir_tmp_keys, area))
+
+
+def reencrypt_area_eyaml_file(area):
+    """Reencrypt the area eyaml file with the area eyaml keys previously
+       extracted by decrypt_extract_eyaml_keys()."""
+    area_eyaml_file_path   = os.path.join(conf.dir_hieradata_private, conf.cluster,
+                                         'areas', area + '.yaml')
+    area_eyaml_private_key = os.path.join(conf.dir_tmp_keys, area,
+                                          'keys', 'private_key.pkcs7.pem')
+    area_eyaml_public_key  = os.path.join(conf.dir_tmp_keys, area,
+                                          'keys', 'public_key.pkcs7.pem')
+    logger.debug("reencrypt %s with area %s eyaml keys",
+                 area_eyaml_file_path, area)
+
+    # decrypt the file using system keys with:
+    #   eyaml decrypt --eyaml $FILE
+    cmd = ['eyaml', 'decrypt', '--eyaml', area_eyaml_file_path]
+    eyaml_run = subprocess.check_output(cmd, universal_newlines=True)
+    # rewrite the buffered output to the file
+    with open(area_eyaml_file_path, 'w') as fh:
+        fh.write(eyaml_run)
+
+    # recrypt the file with:
+    #   eyaml recrypt --pkcs7-private-key $PRIV --pkcs7-public-key $PUB $FILE
+    cmd = ['eyaml', 'recrypt',
+           '--pkcs7-private-key', area_eyaml_private_key,
+           '--pkcs7-public-key', area_eyaml_public_key,
+           area_eyaml_file_path]
+    subprocess.check_call(cmd)
+
+
+def build_tarballs():
+    """Build the tarballs for all areas."""
+    for area in conf.areas:
+        build_tarball(area)
+
+
+def build_tarball(area):
+
+    logger.info("creating archive %s", conf.archive_path(area))
+    os.makedirs(os.path.dirname(conf.archive_path(area)))
+    tar = tarfile.open(name=conf.archive_path(area), mode='w:xz', dereference=True)
 
     # generic modules
     seen_modules = []
@@ -355,7 +499,26 @@ def build_tarball():
     if os.path.exists(conf.dir_hieradata_private) and \
        os.path.isdir(conf.dir_hieradata_private):
         logger.debug("adding private hieradata dir %s", conf.dir_hieradata_private)
-        tar.add(conf.dir_hieradata_private, arcname=os.path.join(conf.environment, 'hieradata', 'private'))
+        # The area tarbal must contain these files:
+        #   $dir_hieradata_private/*.yaml
+        #   $dir_hieradata_private/$cluster/*.yaml
+        #   $dir_hieradata_private/$cluster/roles/*.yaml
+        #   $dir_hieradata_private/$cluster/areas/$area.yaml
+        base_arcname = os.path.join(conf.environment, 'hieradata', 'private')
+        arch_files = \
+          glob.glob(os.path.join(conf.dir_hieradata_private, '*.yaml')) + \
+          glob.glob(os.path.join(conf.dir_hieradata_private, conf.cluster, '*.yaml')) + \
+          glob.glob(os.path.join(conf.dir_hieradata_private, conf.cluster, 'roles', '*.yaml')) + \
+          [ os.path.join(conf.dir_hieradata_private, conf.cluster, 'areas', area + '.yaml') ]
+        if area != conf.main_area:
+            # re-enc area yaml file
+            reencrypt_area_eyaml_file(area)
+        for arch_file in arch_files:
+            # remove dir_hieradata_private from arch_file
+            subpath = arch_file[len(conf.dir_hieradata_private)+1:]
+            tar.add(arch_file,
+                    arcname=os.path.join(base_arcname, subpath),
+                    recursive=False)
     else:
         logger.warning("Configured private hieradata dir is missing: '%s'",
                        conf.dir_hieradata_private)
@@ -371,6 +534,61 @@ def gen_env_conf():
         env_f.write("modulepath=modules_private:modules_generic\n")
         env_f.write("manifest=manifests/cluster.pp\n")
 
+
+def reenc_file(encrypted_file, source_key, dest_key):
+    logger.debug("reencrypt private file %s with cluster_decrypt_password",
+                 encrypted_file)
+    # decrypt and re-encrypt file
+    unencrypted_file = encrypted_file[:-4]
+    decrypt_file(encrypted_file, unencrypted_file, source_key)
+    encrypt_file(unencrypted_file, encrypted_file, dest_key)
+    os.remove(unencrypted_file)
+    return True
+
+def copy_reenc_private_files():
+    """This procedure merges the cluster and $area private files directories
+       into one $area hierarchy. Then, for all areas except the main one, it
+       searches encoded files to reencrypt them using the
+       cluster_decrypt_password of this area.
+    """
+    # Find all files in conf.dir_files_private, decrypt them with main area
+    # cluster_decrypt_passwd and re-encrypt them with cluster_decrypt_password of
+    # each other area
+    pool = Pool()
+    results = []
+    master_key = get_area_decrypt_password(conf.main_area)
+    for area in conf.areas:
+        # copy file in area subdir
+        private_files_area_build_dir = os.path.join(conf.dir_files_private, area)
+        for subdir in ['cluster', area]:
+            conf_copy(os.path.join(conf.src_dir_files_private, subdir),
+                      private_files_area_build_dir)
+        if area != conf.main_area:
+            # find all encrypted files
+            encrypted_files=[]
+            for root, dirnames, filenames in os.walk(private_files_area_build_dir):
+                for filename in fnmatch.filter(filenames, '*.enc'):
+                      encrypted_files.append(os.path.join(root, filename))
+            # read area cluster_decrypt_password
+            area_key = get_area_decrypt_password(area)
+            for encrypted_file in encrypted_files:
+                results.append(pool.apply_async(
+                    reenc_file,
+                    [encrypted_file, master_key, area_key]
+                ))
+    pool.close()
+    pool.join()
+    success = 0
+    errors = 0
+    for result in results:
+        function_return = result.get()
+        if function_return:
+            success += 1
+        else:
+            errors += 1
+    logger.info("Reenc Files: Reencrypted %d files, %d errors", success, errors)
+
+
 def _push_posix():
 
     logger.info("posix push: pushing data in %s", conf.destination)
@@ -379,8 +597,11 @@ def _push_posix():
         logger.debug("posix push: create destination dir %s", conf.destination)
         os.makedirs(conf.destination, exist_ok=True)
 
-    logger.debug("posix push: copying tarball")
-    shutil.copy(conf.archive, conf.destination)
+    for area in conf.areas:
+        logger.debug("posix push: copying area %s tarball", area)
+        area_dest = os.path.join(conf.destination, area)
+        os.makedirs(area_dest, exist_ok=True)
+        shutil.copy(conf.archive_path(area), area_dest)
 
     dir_files = os.path.join(conf.destination, 'files')
     if os.path.isdir(dir_files):
@@ -398,8 +619,8 @@ def _push_posix():
     shutil.copy(conf.conf_puppet, conf.destination)
     logger.debug("posix push: copying hiera conf")
     shutil.copy(conf.conf_hiera, conf.destination)
-    logger.debug("posix push: copying private facts")
-    shutil.copy(conf.facts_private, conf.destination)
+    logger.debug("posix push: copying private cluster nodes description")
+    shutil.copy(conf.nodes_private, conf.destination)
 
     # Set permissions
     for root, dirs, files in os.walk(conf.destination):
@@ -539,7 +760,7 @@ def _s3_upload(source_path,
         for result in results.values():
             if result.ready():
                 finished += 1
-        logger.info("SFTP push: Transfered files %d/%d", finished, len(results))
+        logger.info("S3 push: Transfered files %d/%d", finished, len(results))
         time.sleep(1)
     for dest_file_path, result in results.items():
         result.get()
@@ -607,9 +828,8 @@ def _s3_rmrf(bucket, prefix):
         errors += len(report.errors)
     logger.info("S3 push: Deleted %d keys, %d errors", deleted, errors)
 
-def _push_s3():
-    logger.info("S3 push: pushing data in bucket %s", conf.s3_bucket_name)
-
+def _bucket_conn_s3(conf):
+    """Connect to S3 server and return the bucket."""
     conn = boto.connect_s3(
         aws_access_key_id=conf.s3_access_key,
         aws_secret_access_key=conf.s3_secret_key,
@@ -620,15 +840,23 @@ def _push_s3():
     )
     bucket = conn.get_bucket(conf.s3_bucket_name)
     bucket.set_acl('public-read')
+    return bucket
+
+def _push_s3():
+    logger.info("S3 push: pushing data in bucket %s", conf.s3_bucket_name)
+
+    bucket = _bucket_conn_s3(conf)
 
     logger.info("S3 push: get remote objects list")
     obj_md5s = _s3_list_md5(bucket, conf.destination)
 
     touched_objects = []
 
-    logger.info("S3 push: copying tarball")
-    lst = _s3_upload(conf.archive, bucket, conf.destination, object_md5s=obj_md5s)
-    touched_objects = list(set(touched_objects + lst))
+    for area in conf.areas:
+        logger.info("S3 push: copying area %s tarball", area)
+        area_dest = os.path.join(conf.destination, area)
+        lst = _s3_upload(conf.archive_path(area), bucket, area_dest, object_md5s=obj_md5s)
+        touched_objects = list(set(touched_objects + lst))
 
 
     logger.info("S3 push: copying private files")
@@ -641,8 +869,8 @@ def _push_s3():
     logger.info("S3 push: copying hiera conf")
     lst = _s3_upload(conf.conf_hiera, bucket, conf.destination, object_md5s=obj_md5s)
     touched_objects = list(set(touched_objects + lst))
-    logger.info("S3 push: copying private facts")
-    lst = _s3_upload(conf.facts_private, bucket, conf.destination, object_md5s=obj_md5s)
+    logger.info("S3 push: copying private cluster nodes description")
+    lst = _s3_upload(conf.nodes_private, bucket, conf.destination, object_md5s=obj_md5s)
     touched_objects = list(set(touched_objects + lst))
 
     logger.info("S3 push: Removing old files")
@@ -721,8 +949,8 @@ def _sftp_upload(source_path, sftp_client, destination_path, clean=True):
         # Set Perms
         sftp_client.chmod(dest_file_path, 0o644)
 
-def _sftp_push_host(host, conf):
-
+def _sftp_connect(host, conf, verb):
+    """Connect to SFTP server host. Verb is used in prefix of log messages."""
     key = paramiko.RSAKey.from_private_key_file(conf.sftp_private_key)
     username = conf.sftp_username
 
@@ -730,20 +958,26 @@ def _sftp_push_host(host, conf):
         transport = paramiko.Transport((host, 22))
         transport.connect(username=username, pkey=key)
     except socket.gaierror as e:
-        logger.error("SFTP push: Failed to connect to host %s" % host)
-        logger.info("SFTP push: Connection error: %s." % e)
+        logger.error("SFTP %s: Failed to connect to host %s", verb, host)
+        logger.info("SFTP %s: Connection error: %s.", verb, e)
         return
     except paramiko.ssh_exception.SSHException as e:
-        logger.error("SFTP push: SSH failed to %s@%s" % (username, host))
-        logger.info("SFTP push: SSH error: %s." % e)
+        logger.error("SFTP %s: SSH failed to %s@%s", verb, username, host)
+        logger.info("SFTP %s: SSH error: %s.", verb, e)
         return
-    sftp_client = paramiko.SFTPClient.from_transport(transport)
+    return paramiko.SFTPClient.from_transport(transport)
+
+def _sftp_push_host(host, conf):
+
+    sftp_client = _sftp_connect(host, conf, verb='push')
 
     logger.debug("SFTP push: Cleaning destination %s", conf.destination)
     _sftp_rmrf(sftp_client, conf.destination)
 
-    logger.debug("SFTP push: copying tarball")
-    _sftp_upload(conf.archive, sftp_client, conf.destination)
+    for area in conf.areas:
+        logger.debug("SFTP push: copying area %s tarball", area)
+        area_dest = os.path.join(conf.destination, area)
+        _sftp_upload(conf.archive_path(area), sftp_client, area_dest)
 
     logger.debug("SFTP push: copying private files")
     dir_files = os.path.join(conf.destination, 'files')
@@ -752,8 +986,8 @@ def _sftp_push_host(host, conf):
     _sftp_upload(conf.conf_puppet, sftp_client, conf.destination)
     logger.debug("SFTP push: copying hiera conf")
     _sftp_upload(conf.conf_hiera, sftp_client, conf.destination)
-    logger.debug("SFTP push: copying private facts")
-    _sftp_upload(conf.facts_private, sftp_client, conf.destination)
+    logger.debug("SFTP push: copying private cluster nodes description")
+    _sftp_upload(conf.nodes_private, sftp_client, conf.destination)
 
 
 def _push_sftp():
@@ -788,6 +1022,108 @@ def push():
         logger.error("unsupported push mode %s", conf.mode)
         sys.exit(1)
 
+def _formatted_list_results(envs):
+    """Compose multiline string of formatted results w/ list comprehension
+       on a list of tuples (filename, mtime as string)."""
+    return '\n'.join([ "  - %-20s [%s]" % (env[0], env[1])
+                       for env in envs ])
+
+def _list_environments_posix():
+    """List pushed environments in POSIX directory."""
+
+    logger.info("posix list: in %s", conf.destination_root)
+
+    if not os.path.isdir(conf.destination_root):
+        logger.info("posix list: no environment")
+        return
+
+    env_dirs = sorted(os.listdir(conf.destination_root))
+    # build list of envs tuples (name, mtime)
+    envs = [ (env_dir,
+              datetime.utcfromtimestamp(
+                os.stat(os.path.join(conf.destination_root, env_dir)).st_mtime) \
+                .strftime('%Y-%m-%d %H:%M:%S'))
+             for env_dir in env_dirs ]
+    result_s = _formatted_list_results(envs)
+
+    logger.info("posix list: available environment:\n%s", result_s)
+
+def _list_environments_s3():
+    """List pushed environments in Ceph/S3 Bucket."""
+
+    logger.info("S3 list: listing environments in bucket %s", conf.s3_bucket_name)
+
+    bucket = _bucket_conn_s3(conf)
+
+    logger.info("S3 list: get remote objects list")
+    objs = bucket.list(prefix=conf.destination_root)
+    envs = []
+    for obj in objs:
+        name_members = obj.name.split('/')
+        if len(name_members) == 3:
+            envs.append((name_members[1], obj.last_modified))
+    result_s = _formatted_list_results(envs)
+
+    logger.info("S3 list: available environments:\n%s", result_s)
+
+def _sftp_list_host(host, conf):
+    """Returns a list of tuples with filename and mtime of pushed environments
+       on a specific SFTP server."""
+    sftp_client = _sftp_connect(host, conf, verb='list')
+
+    results = []
+    for attr in sftp_client.listdir_iter(conf.destination_root):
+        results.append((attr.filename,
+                        datetime.utcfromtimestamp(attr.st_mtime) \
+                          .strftime('%Y-%m-%d %H:%M:%S')))
+
+    return sorted(results)
+
+def _list_environments_sftp():
+    """List pushed environment asynchronously on all SFTP servers."""
+
+    logger.info("SFTP list: list environments on hosts %s", conf.sftp_hosts)
+
+    pool = Pool()
+    results = {}
+    for host in conf.sftp_hosts:
+       results[host] = pool.apply_async(_sftp_list_host, [host, conf])
+    pool.close()
+    finished = 0
+    while finished < len(results):
+        finished = 0
+        for result in results.values():
+            if result.ready():
+                finished += 1
+        logger.info("SFTP list: Finished host %d/%d", finished, len(results))
+        time.sleep(1)
+    # Build a hash with string of formatted result as keys and list of hosts
+    # having this result as values.
+    all_hosts_envs = {}
+    for host, result in results.items():
+        envs = result.get()  # list of tuples
+        result_s = _formatted_list_results(envs)
+        if result_s in all_hosts_envs:
+            all_hosts_envs[result_s].append(host)
+        else:
+            all_hosts_envs[result_s] = [ host ]
+    pool.join()
+    for envs_s, hosts in all_hosts_envs.items():
+        logger.info("SFTP list: hosts: %s environments:\n%s", ','.join(hosts), envs_s)
+
+def list_environments():
+    """List pushed environments by calling the appropriate function depending
+       on the storage backend."""
+    if conf.mode == 'posix':
+        _list_environments_posix()
+    elif conf.mode == 'sftp':
+        _list_environments_sftp()
+    elif conf.mode == 's3':
+        _list_environments_s3()
+    else:
+        logger.error("environments listing unsupported for mode %s", conf.mode)
+        sys.exit(1)
+
 def cleanup_run():
     """Remove the run tmp dir."""
 
@@ -819,10 +1155,14 @@ def main():
     #
     if conf.full_tmp_cleanup:
         cleanup_full()
+    elif conf.list_environments:
+        list_environments()
     else:
-        mktmpd()
+        init_tmpd()
+        decrypt_extract_eyaml_keys()
+        copy_reenc_private_files()
         gen_env_conf()
-        build_tarball()
+        build_tarballs()
         push()
         cleanup_run()
 

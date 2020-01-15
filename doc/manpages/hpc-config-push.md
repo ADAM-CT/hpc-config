@@ -7,7 +7,7 @@ hpc-config-push - push puppet-hpc configuration into central storage
 # SYNOPSIS
 
     hpc-config-push [-h] [-d] [-c [CONF]] [-e [ENVIRONMENT]] [-V [VERSION]]
-                    [--full-tmp-cleanup]
+                    [--full-tmp-cleanup]i [-l] [--enable-python-warnings]
 
 # DESCRIPTION
 
@@ -27,6 +27,7 @@ private data and files and packaged Puppet modules.
     -V [VERSION], --version [VERSION]
                           Version of the pushed config
     --full-tmp-cleanup    Full tmp dir cleanup.
+    -l, --list            List pushed environments.
     --enable-python-warnings
                           Enable some python warnings (deprecation and
                           future warnings are hidden by default)
@@ -38,19 +39,65 @@ development machine as long as they are all at the same directory. The layout
 of this directory should be like in the example below:
 
     some_directory/
-    ├── private-data
-    │   ├── files
-    │   └── hieradata
-    └── puppet-hpc
+    ├── private-data/
+    │   ├── files/
+    │   │   └── $CLUSTER/
+    │   │       ├── cluster/
+    │   │       └── $AREA/
+    │   └── hieradata/
+    │       ├── *.yaml
+    │       └── $CLUSTER/
+    │           ├── *.yaml
+    │           ├── roles/
+    │           │   └── *.yaml
+    │           └── areas/
+    │               └── $AREA.yaml
+    └── puppet-hpc/
 
-`puppet-hpc` is a git checkout of the Generic Puppet Configuration for HPC Clusters
-you downloaded with this documentation.
-`private-data` is a directory containing all the specific data for your cluster.
-It's advised to also keep this in git and simply fetch a copy.
+Where:
+
+  - *$CLUSTER* is a cluster name,
+  - *$AREA* is an area name (see **AREAS** section for more details).
+
+The *puppet-hpc/* directory is a checkout of Puppet-HPC.
+
+The *private-data/* directory contains all the specific data for every clusters
+of your organization. Please refer to Puppet-HPC reference documentation for
+more details about the files hierarchy of this directory. It's advised to also
+keep this in git and simply fetch a copy.
 
 The destination should be shared between all the central storage servers. It
 must be accessible as a simple POSIX file system, via the Amazon S3 API or a
 set of SFTP servers.
+
+# AREAS
+
+*hpc-config-push* supports splitting cluster configuration environments into
+multiple areas for security purpose. Each area has its own set of encryption
+keys. Please refer to Puppet-HPC reference documentation for more details on
+this mechanism.
+
+If multiple areas are declared into its configuration file, *hpc-config-push*
+considers the first area to be the **main** area. As a requirement, all the
+encrypted files located into the *private-data/files/\$CLUSTER* directory must be
+encrypted with the cluster **main** area files encryption key, and all the eyaml
+encrypted parameters in the *private-data/hieradata/\$CLUSTER/areas* file must be
+encrypted with the cluster **main** area eyaml encryption key.
+
+When the configuration environment is pushed, *hpc-config-push* performs
+on-the-fly re-encryption of area's sensitive data using area specific
+encryption keys. It includes the encrypted files (\*.enc) located in the
+*cluster* and the *\$AREA* subdirectories and the eyaml encrypted parameters in
+the *\$CLUSTER/areas/\$AREA.yaml* file.
+
+Then, *hpc-config-push* generates a subset of the configuration environment for
+each area, excluding the sensitive data of all other areas.
+
+This way, each area only has access to its own sensitive data encrypted with
+its own set of encryption keys.
+
+By default, *hpc-config-push* considers there is only one **default** area, and
+no re-encryption is performed.
 
 # CONFIGURATION FILE
 
@@ -65,6 +112,7 @@ The '[global]' section defines the defaults parameters used:
     cluster = <cluster name>
     environment = <default environment>
     version = <default version>
+    areas = <list of cluster areas>
     destination = <default directory on central storage>
     mode = <push mode, can be 's3', 'posix' or 'sftp'>
 
@@ -102,7 +150,7 @@ And/or a '[paths]' section:
                   (default: ${privatedata}/puppet-config/${global:cluster}/puppet.conf)
     hiera_conf = <directory where to find the puppet.conf file> (default:
                  ${privatedata}/puppet-config/${global:cluster}/hiera.yaml)
-    facts_private = ${privatedata}/puppet-config/${global:cluster}/hpc-config-facts.yaml
+    nodes_private = ${privatedata}/puppet-config/${global:cluster}/cluster-nodes.yaml
     modules_generic = <directories where to find the generic puppet modules>
                       (default: ${puppethpc}/puppet-config/cluster,
                        ${puppethpc}/puppet-config/modules,
@@ -132,6 +180,10 @@ To simply push the current configuration in the default environment:
 To push the current configuration in the 'test' environment:
 
     hpc-config-push -e test
+
+To list the already pushed environments:
+
+    hpc-config-push --list
 
 # SEE ALSO
 
